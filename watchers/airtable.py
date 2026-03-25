@@ -51,30 +51,53 @@ class AirtableWatcher(BaseWatcher):
         self._base_id = base_id
 
     def fetch_items(self) -> list[WatcherItem]:
-        headers = {
-            "Accept": "application/json",
-            "x-requested-with": "XMLHttpRequest",
-            "User-Agent": "Mozilla/5.0 rfp-watcher/1.0",
-        }
-        if self._base_id:
-            headers["x-airtable-application-id"] = self._base_id
+        # Fallback: scrape the HTML page for RFPs
+        import re
+        from html import unescape
 
-        resp = requests.get(
-            self._url,
-            headers=headers,
-            params={"stringifiedObjectParams": "{}"},
-            timeout=20,
-        )
+        resp = requests.get(AIRTABLE_SHARED_VIEW_URL, timeout=20)
         resp.raise_for_status()
-        data = resp.json()
+        html = resp.text
 
-        table  = data.get("data", {}).get("tableData", {})
-        rows   = table.get("rows", [])
-        # visibleFields gives us fieldId → human name mapping
-        cols   = data.get("data", {}).get("visibleFields", [])
-        col_map = {c["fieldId"]: c.get("name", c["fieldId"]) for c in cols}
+        # Each RFP is a section with a header like: # [Title](#)
+        # We'll use a regex to find all RFP blocks
+        rfp_blocks = re.split(r"# \\[([^\]]+)\\]\(#\)", html)
+        items = []
+        # rfp_blocks[0] is preamble, then alternating: title, body, title, body...
+        for i in range(1, len(rfp_blocks), 2):
+            title = unescape(rfp_blocks[i]).strip()
+            body = rfp_blocks[i+1] if i+1 < len(rfp_blocks) else ""
+            # Extract fields from body
+            def extract_field(field, text):
+                m = re.search(rf"{re.escape(field)}\s+(.+?)(?:\\s{2,}|$)", text)
+                return m.group(1).strip() if m else None
 
-        return [self._to_item(row, col_map) for row in rows]
+            metadata = {}
+            for field in [
+                "RFP Status", "Application Deadline", "Application Link", "Completion Deadline",
+                "Maximum Grant Amount (USD equivalent)", "Payment Currency", "Context", "Deliverables", "Impact", "Problem", "Proposed Solution"
+            ]:
+                val = extract_field(field, body)
+                if val:
+                    metadata[field] = val
+
+            # Fallback: try to get a link
+            link = extract_field("Application Link", body)
+            if not link:
+                m = re.search(r"https://airtable.com/app[\w]+/pag[\w]+/form", body)
+                if m:
+                    link = m.group(0)
+
+            # Compose WatcherItem
+            items.append(
+                WatcherItem(
+                    id=f"{title.lower().replace(' ', '_')}",
+                    title=title,
+                    url=link or AIRTABLE_SHARED_VIEW_URL,
+                    metadata=metadata,
+                )
+            )
+        return items
 
     def _to_item(self, row: dict, col_map: dict) -> WatcherItem:
         record_id = row.get("id", "")
