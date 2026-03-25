@@ -13,6 +13,19 @@ from watchers.base import BaseWatcher, WatcherItem
 
 logger = logging.getLogger(__name__)
 
+_TITLE_FIELDS = (
+    "RFP Title",
+    "Title",
+    "Name",
+    "Project",
+)
+_LINK_FIELDS = (
+    "Application Link",
+    "Link",
+    "URL",
+    "Project Link",
+)
+
 # Airtable's internal endpoint for fetching public shared-view data.
 _READ_ENDPOINT = "https://airtable.com/v0.3/view/{share_id}/readSharedViewData"
 
@@ -67,8 +80,7 @@ class AirtableWatcher(BaseWatcher):
         record_id = row.get("id", "")
         cells     = row.get("cellValuesByFieldId", {})
 
-        title_val: str | None = None
-        meta: dict = {}
+        values_by_name: dict[str, str] = {}
 
         for field_id, value in cells.items():
             if value is None or value == "":
@@ -79,17 +91,28 @@ class AirtableWatcher(BaseWatcher):
                 if isinstance(value, list)
                 else str(value)
             )
-            if title_val is None:
-                title_val = str_val  # first non-empty field → title
-            else:
-                meta[name] = str_val
+            values_by_name[name] = str_val
 
-        # Pull URL out of metadata if present
-        url_val = meta.pop("Link", "") or meta.pop("URL", "") or meta.pop("Project Link", "") or ""
+        # Identify and remove title from metadata
+        title_key = next((f for f in _TITLE_FIELDS if values_by_name.get(f)), None)
+        if title_key:
+            title_val = values_by_name.pop(title_key)
+        elif values_by_name:
+            first_key = next(iter(values_by_name))
+            title_val = values_by_name.pop(first_key)
+        else:
+            title_val = None
+
+        # Identify and remove link from metadata
+        url_val = ""
+        for field in _LINK_FIELDS:
+            if field in values_by_name:
+                url_val = values_by_name.pop(field)
+                break
 
         return WatcherItem(
             id=record_id,
             title=title_val or f"Record {record_id}",
             url=url_val,
-            metadata=meta,
+            metadata=values_by_name,
         )

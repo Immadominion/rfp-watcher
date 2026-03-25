@@ -161,8 +161,12 @@ across deploys so no state is lost.
 | Command | What it does |
 |---|---|
 | `/start` | Subscribe — registers your chat ID |
+| `/rfps` | Lists all current RFPs with status, deadline, and link when available |
+| `/open` | Lists only RFPs still open for submissions |
+| `/closed` | Lists only RFPs that are closed for submissions |
 | `/stop` | Unsubscribe |
 | `/status` | Shows subscriber count and poll interval |
+| `/help` | Shows the full command list |
 
 ---
 
