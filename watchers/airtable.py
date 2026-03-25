@@ -60,8 +60,8 @@ class AirtableWatcher(BaseWatcher):
         html = resp.text
 
         # Each RFP is a section with a header like: # [Title](#)
-        # We'll use a regex to find all RFP blocks
-        rfp_blocks = re.split(r"# \\[([^\]]+)\\]\(#\)", html)
+        # We'll use a regex to find all RFP blocks (no doubled backslashes, balanced parens)
+        rfp_blocks = re.split(r'# \[([^\]]+)\]\(#\)', html)
         items = []
         # rfp_blocks[0] is preamble, then alternating: title, body, title, body...
         for i in range(1, len(rfp_blocks), 2):
