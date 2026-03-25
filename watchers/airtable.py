@@ -59,17 +59,29 @@ class AirtableWatcher(BaseWatcher):
         resp.raise_for_status()
         html = resp.text
 
-        # Each RFP is a section with a header like: # [Title](#)
-        # We'll use a regex to find all RFP blocks (no doubled backslashes, balanced parens)
-        rfp_blocks = re.split(r'# \[([^\]]+)\]\(#\)', html)
+        # Use BeautifulSoup to robustly extract RFPs from the HTML
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
         items = []
-        # rfp_blocks[0] is preamble, then alternating: title, body, title, body...
-        for i in range(1, len(rfp_blocks), 2):
-            title = unescape(rfp_blocks[i]).strip()
-            body = rfp_blocks[i+1] if i+1 < len(rfp_blocks) else ""
+        # Find all RFP titles (they appear as <h1> or <h2> with anchor or strong tags)
+        for header in soup.find_all(["h1", "h2", "h3"]):
+            title = header.get_text(strip=True)
+            # Heuristic: skip non-RFP headers
+            if not title or "Solana Mobile" in title or "Active RFPs" in title:
+                continue
+            # The RFP body is the next siblings until the next header
+            body_parts = []
+            for sib in header.next_siblings:
+                if getattr(sib, "name", None) in ("h1", "h2", "h3"):
+                    break
+                if hasattr(sib, "get_text"):
+                    body_parts.append(sib.get_text(" ", strip=True))
+                elif isinstance(sib, str):
+                    body_parts.append(sib.strip())
+            body = " ".join(body_parts)
             # Extract fields from body
             def extract_field(field, text):
-                m = re.search(rf"{re.escape(field)}\s+(.+?)(?:\\s{2,}|$)", text)
+                m = re.search(rf"{re.escape(field)}\s+(.+?)(?:\s{2,}|$)", text)
                 return m.group(1).strip() if m else None
 
             metadata = {}
