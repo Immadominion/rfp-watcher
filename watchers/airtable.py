@@ -1,9 +1,15 @@
 """
-Watches a *public* Airtable shared view for new records.
-No API key or account ownership required — uses Airtable's internal
-shared-view endpoint, the same one their browser frontend calls.
+Watches a *public* Airtable shared-page view for new records.
+
+Approach (two-step, no API key required):
+1. GET the shared-page URL to obtain session cookies, csrfToken,
+   accessPolicy, and sharedPageId from the embedded ``window.initData``.
+2. Call ``/v0.3/application/{appId}/readForSharedPages`` with those
+   credentials to get the actual row data + schema.
 """
+import json
 import logging
+import re
 from urllib.parse import urlparse
 
 import requests
@@ -14,6 +20,7 @@ from watchers.base import BaseWatcher, WatcherItem
 logger = logging.getLogger(__name__)
 
 _TITLE_FIELDS = (
+    "Project Name",
     "RFP Title",
     "Title",
     "Name",
@@ -26,101 +33,196 @@ _LINK_FIELDS = (
     "Project Link",
 )
 
-# Airtable's internal endpoint for fetching public shared-view data.
-_READ_ENDPOINT = "https://airtable.com/v0.3/view/{share_id}/readSharedViewData"
+# Rich-text fields are stored as OT documents; we extract the plain text.
+_SKIP_METADATA_FIELDS = {"Context", "Problem", "Proposed Solution",
+                         "Impact", "Deliverables", "Payout breakdown"}
+
+
+def _extract_plain_text(value) -> str:
+    """Return plain text from a rich-text (OT document) cell value."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for segment in value.get("documentValue", []):
+            text = segment.get("insert")
+            if text:
+                parts.append(text)
+        return "".join(parts).strip()
+    return str(value)
+
+
+def _parse_initdata(html: str) -> dict:
+    """Extract ``window.initData = { … }`` from the Airtable HTML shell."""
+    marker = "window.initData = {"
+    idx = html.find(marker)
+    if idx == -1:
+        raise ValueError("window.initData not found in page HTML")
+    start = html.index("{", idx)
+    depth = 0
+    in_str = False
+    esc = False
+    end = start
+    for i in range(start, len(html)):
+        c = html[i]
+        if esc:
+            esc = False
+            continue
+        if c == "\\" and in_str:
+            esc = True
+            continue
+        if c == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    return json.loads(html[start:end])
 
 
 class AirtableWatcher(BaseWatcher):
-    """Watches a public Airtable shared view for new records."""
+    """Watches a public Airtable shared page for new records."""
 
     watcher_id = "airtable_rfps"
     label = "Solana Mobile RFPs (Airtable)"
 
     def __init__(self) -> None:
         parts = urlparse(AIRTABLE_SHARED_VIEW_URL).path.strip("/").split("/")
-        share_id = next((p for p in parts if p.startswith("shr")), None)
-        base_id  = next((p for p in parts if p.startswith("app")), None)
+        self._share_id = next((p for p in parts if p.startswith("shr")), None)
+        self._base_id  = next((p for p in parts if p.startswith("app")), None)
 
-        if not share_id:
+        if not self._share_id:
             raise ValueError(
                 f"No share ID (shr…) found in URL: {AIRTABLE_SHARED_VIEW_URL}\n"
                 "Expected format: https://airtable.com/appXXX/shrXXX"
             )
 
-        self._url     = _READ_ENDPOINT.format(share_id=share_id)
-        self._base_id = base_id
+    # ── public API ───────────────────────────────────────────────
 
     def fetch_items(self) -> list[WatcherItem]:
-        # Fallback: scrape the HTML page for RFPs
-        import re
-        from html import unescape
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        })
 
-        resp = requests.get(AIRTABLE_SHARED_VIEW_URL, timeout=20)
+        # Step 1 — load the page shell to get cookies + initData
+        page_resp = session.get(AIRTABLE_SHARED_VIEW_URL, timeout=20)
+        page_resp.raise_for_status()
+        init_data = _parse_initdata(page_resp.text)
+
+        access_policy = init_data["accessPolicy"]
+        page_id       = init_data["sharedPageId"]
+        page_load_id  = init_data["pageLoadId"]
+        app_id        = self._base_id or init_data.get(
+            "sharedModelParentApplicationId", ""
+        )
+
+        # Step 2 — call the real data endpoint
+        api_url = (
+            f"https://airtable.com/v0.3/application/{app_id}"
+            "/readForSharedPages"
+        )
+        headers = {
+            "Accept": "application/json",
+            "x-airtable-inter-service-client": "webClient",
+            "x-airtable-page-load-id": page_load_id,
+            "x-airtable-application-id": app_id,
+            "x-time-zone": "UTC",
+            "x-user-locale": "en",
+            "x-requested-with": "XMLHttpRequest",
+            "Referer": AIRTABLE_SHARED_VIEW_URL,
+            "Origin": "https://airtable.com",
+        }
+        params = {
+            "stringifiedObjectParams": json.dumps({
+                "includeDataForPageId": page_id,
+                "shouldIncludeSchemaChecksum": True,
+                "expectedPageLayoutSchemaVersion": 26,
+                "shouldPreloadQueries": True,
+                "shouldPreloadAllPossibleContainerElementQueries": True,
+                "urlSearch": "",
+                "includePageLayoutTypeInfo": True,
+                "includeDataForExpandedRowPageFromQueryContainer": True,
+                "includeDataForAllReferencedExpandedRowPagesInLayout": True,
+                "navigationMode": "view",
+            }),
+            "requestId": f"req{page_load_id}",
+            "accessPolicy": access_policy,
+        }
+
+        resp = session.get(api_url, headers=headers, params=params, timeout=30)
         resp.raise_for_status()
-        html = resp.text
+        body = resp.json()
 
-        # Use BeautifulSoup to robustly extract RFPs from the HTML
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "html.parser")
-        items = []
-        # Find all RFP titles (they appear as <h1> or <h2> with anchor or strong tags)
-        for header in soup.find_all(["h1", "h2", "h3"]):
-            title = header.get_text(strip=True)
-            # Heuristic: skip non-RFP headers
-            if not title or "Solana Mobile" in title or "Active RFPs" in title:
-                continue
-            # The RFP body is the next siblings until the next header
-            body_parts = []
-            for sib in header.next_siblings:
-                if getattr(sib, "name", None) in ("h1", "h2", "h3"):
-                    break
-                if hasattr(sib, "get_text"):
-                    body_parts.append(sib.get_text(" ", strip=True))
-                elif isinstance(sib, str):
-                    body_parts.append(sib.strip())
-            body = " ".join(body_parts)
-            # Extract fields from body
-            def extract_field(field, text):
-                m = re.search(rf"{re.escape(field)}\s+(.+?)(?:\s{2,}|$)", text)
-                return m.group(1).strip() if m else None
+        if body.get("msg") != "SUCCESS":
+            raise RuntimeError(f"Airtable API error: {body}")
 
-            metadata = {}
-            for field in [
-                "RFP Status", "Application Deadline", "Application Link", "Completion Deadline",
-                "Maximum Grant Amount (USD equivalent)", "Payment Currency", "Context", "Deliverables", "Impact", "Problem", "Proposed Solution"
-            ]:
-                val = extract_field(field, body)
-                if val:
-                    metadata[field] = val
+        data = body["data"]
 
-            # Fallback: try to get a link
-            link = extract_field("Application Link", body)
-            if not link:
-                m = re.search(r"https://airtable.com/app[\w]+/pag[\w]+/form", body)
-                if m:
-                    link = m.group(0)
+        # Build column-id → name map and select-option maps
+        col_map: dict[str, str] = {}
+        select_choices: dict[str, dict[str, str]] = {}  # colId → {optId: name}
+        for ts in data.get("tableSchemas", []):
+            for col in ts.get("columns", []):
+                col_map[col["id"]] = col.get("name", col["id"])
+                if col.get("type") in ("select", "multiSelect"):
+                    choices = col.get("typeOptions", {}).get("choices", {})
+                    select_choices[col["id"]] = {
+                        cid: c.get("name", cid) for cid, c in choices.items()
+                    }
 
-            # Compose WatcherItem
-            items.append(
-                WatcherItem(
-                    id=f"{title.lower().replace(' ', '_')}",
-                    title=title,
-                    url=link or AIRTABLE_SHARED_VIEW_URL,
-                    metadata=metadata,
+        # Extract rows from preloadPageQueryResults
+        pq = data.get("preloadPageQueryResults", {})
+        table_data_by_id = pq.get("tableDataById", {})
+
+        items: list[WatcherItem] = []
+        for _table_id, table_data in table_data_by_id.items():
+            rows_by_id = table_data.get("partialRowById", {})
+            for rec_id, row in rows_by_id.items():
+                item = self._to_item(
+                    row, col_map, select_choices
                 )
-            )
+                items.append(item)
+
         return items
 
-    def _to_item(self, row: dict, col_map: dict) -> WatcherItem:
+    # ── private helpers ──────────────────────────────────────────
+
+    def _to_item(
+        self,
+        row: dict,
+        col_map: dict[str, str],
+        select_choices: dict[str, dict[str, str]],
+    ) -> WatcherItem:
         record_id = row.get("id", "")
-        cells     = row.get("cellValuesByFieldId", {})
+        cells = row.get("cellValuesByColumnId", {})
 
         values_by_name: dict[str, str] = {}
-
         for field_id, value in cells.items():
             if value is None or value == "":
                 continue
-            name    = col_map.get(field_id, field_id)
+            name = col_map.get(field_id, field_id)
+
+            # Resolve select option IDs to human names
+            if field_id in select_choices and isinstance(value, str):
+                value = select_choices[field_id].get(value, value)
+
+            # Rich-text → plain text (skip bulky fields from metadata)
+            if isinstance(value, dict) and "documentValue" in value:
+                if name in _SKIP_METADATA_FIELDS:
+                    continue
+                value = _extract_plain_text(value)
+
             str_val = (
                 ", ".join(str(v) for v in value)
                 if isinstance(value, list)
@@ -128,8 +230,10 @@ class AirtableWatcher(BaseWatcher):
             )
             values_by_name[name] = str_val
 
-        # Identify and remove title from metadata
-        title_key = next((f for f in _TITLE_FIELDS if values_by_name.get(f)), None)
+        # Extract and remove title
+        title_key = next(
+            (f for f in _TITLE_FIELDS if values_by_name.get(f)), None
+        )
         if title_key:
             title_val = values_by_name.pop(title_key)
         elif values_by_name:
@@ -138,7 +242,7 @@ class AirtableWatcher(BaseWatcher):
         else:
             title_val = None
 
-        # Identify and remove link from metadata
+        # Extract and remove link
         url_val = ""
         for field in _LINK_FIELDS:
             if field in values_by_name:
