@@ -1,6 +1,6 @@
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 import telebot
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -259,8 +259,10 @@ def _send_rfp_listing(message: telebot.types.Message, filter_status: str | None 
     if filter_status is not None:
         classified_items = [entry for entry in classified_items if entry[1] == filter_status]
 
+    _FAR_FUTURE = datetime.max.replace(tzinfo=timezone.utc)
+
     classified_items.sort(
-        key=lambda entry: (dl[1] if (dl := _extract_deadline(entry[0])) else datetime.max)
+        key=lambda entry: (dl[1].replace(tzinfo=timezone.utc) if dl[1].tzinfo is None else dl[1]) if (dl := _extract_deadline(entry[0])) else _FAR_FUTURE
     )
 
     if not classified_items:
