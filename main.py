@@ -6,7 +6,7 @@ import telebot
 from apscheduler.schedulers.background import BackgroundScheduler
 
 import db
-from config import POLL_INTERVAL_MINUTES, TELEGRAM_BOT_TOKEN
+from config import POLL_INTERVAL_MINUTES, TELEGRAM_BOT_TOKEN, SOLANA_MOBILE_URL, WALRUS_URL
 from notifiers import telegram as tg
 from watchers.airtable import AirtableWatcher
 
@@ -24,12 +24,12 @@ _MAX_FIELD_LEN = 280
 _OPEN_STATUS = "open"
 _CLOSED_STATUS = "closed"
 _UNKNOWN_STATUS = "unknown"
-_KNOWN_STATUS_FIELDS = ("RFP Status",)
-_KNOWN_DEADLINE_FIELDS = ("Application Deadline", "Submission Deadline", "Deadline")
+_KNOWN_STATUS_FIELDS = ("RFP Status", "Status")
+_KNOWN_DEADLINE_FIELDS = ("Application Deadline", "Application Close Date", "Submission Deadline", "Deadline")
 _STATUS_KEYWORDS = ("status", "submission", "state", "accepting", "open", "close")
 _DEADLINE_KEYWORDS = ("deadline", "due", "close", "closing", "submission")
 _OPEN_HINTS = ("open", "accepting", "active", "live", "current", "ongoing")
-_CLOSED_HINTS = ("closed", "expired", "ended", "complete", "completed", "inactive")
+_CLOSED_HINTS = ("closed", "expired", "ended", "complete", "completed", "inactive", "funded", "decision in progress")
 _DATE_FORMATS = (
     "%Y-%m-%d",
     "%Y/%m/%d",
@@ -46,7 +46,16 @@ _DATE_FORMATS = (
 # ── Registered watchers ───────────────────────────────────────────────────────
 # Add new watcher instances here to monitor additional sources.
 WATCHERS = [
-    AirtableWatcher(),
+    AirtableWatcher(
+        url=SOLANA_MOBILE_URL,
+        watcher_id="airtable_solana_mobile",
+        label="Solana Mobile RFPs",
+    ),
+    AirtableWatcher(
+        url=WALRUS_URL,
+        watcher_id="airtable_walrus",
+        label="Walrus RFPs",
+    ),
 ]
 
 
@@ -246,16 +255,18 @@ def _send_chunked_message(chat_id: int, header: str, bodies: list[str]) -> None:
 
 
 def _send_rfp_listing(message: telebot.types.Message, filter_status: str | None = None) -> None:
-    watcher = WATCHERS[0]
+    all_items = []
+    for watcher in WATCHERS:
+        try:
+            all_items.extend(watcher.fetch_items())
+        except Exception:
+            logger.exception("Failed to fetch items from %s.", watcher.label)
 
-    try:
-        items = watcher.fetch_items()
-    except Exception:
-        logger.exception("Failed to fetch items for listing command.")
+    if not all_items:
         bot.reply_to(message, "I couldn't fetch the RFP list right now. Try again in a minute.")
         return
 
-    classified_items = [(item, _classify_item_status(item)) for item in items]
+    classified_items = [(item, _classify_item_status(item)) for item in all_items]
     if filter_status is not None:
         classified_items = [entry for entry in classified_items if entry[1] == filter_status]
 

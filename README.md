@@ -117,7 +117,7 @@ it just learns what's already there. From then on it only notifies you about new
 
 2. **Create a new Railway service**
 
-   - Go to https://railway.app → your project → **New Service** → **GitHub Repo**
+   - Go to <https://railway.app> → your project → **New Service** → **GitHub Repo**
    - Select the repo you just pushed
    - Railway detects the `Dockerfile` automatically
 
@@ -137,6 +137,7 @@ it just learns what's already there. From then on it only notifies you about new
 
    - Click **Deploy** (or it auto-deploys on push)
    - Check **Logs** tab — you should see:
+
      ```
      Database ready.
      Scheduler started — polling every 15 minutes.
